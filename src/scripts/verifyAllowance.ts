@@ -6,7 +6,11 @@ import { ConsoleLogger } from '../modules/utils/logger';
 async function run(): Promise<void> {
   const logger = new ConsoleLogger();
   const env = loadEnv();
-  const client = await createPolymarketClient({ rpcUrl: env.rpcUrl, privateKey: env.privateKey });
+  const client = await createPolymarketClient({
+    rpcUrl: env.rpcUrl,
+    privateKey: env.privateKey,
+    proxyWallet: env.proxyWallet, // FIXED: was missing
+  });
   logger.info(`Wallet: ${client.wallet.address}`);
   logger.info('Allowance verification not implemented in scaffold.');
 }

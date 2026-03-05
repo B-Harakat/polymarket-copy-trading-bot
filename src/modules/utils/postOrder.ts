@@ -5,12 +5,17 @@ export type OrderSide = 'BUY' | 'SELL';
 
 export type PostOrderInput = {
   client: ClobClient;
-  tokenId: string;            // asset ID — the specific YES or NO token for order construction
-  conditionId: string;        // ADDED: market condition ID — used to look up tickSize/negRisk
+  tokenId: string;
+  conditionId: string;
   side: OrderSide;
-  sizeUsd: number;            // desired USD notional (e.g. 50.00 = $50)
-  price: number;              // signal price used to convert USD → shares
-  maxAcceptablePrice?: number;
+  sizeUsd?: number;       // BUY: convert to shares via price
+  sharesExact?: number;   // SELL: use directly
+  price: number;          // reference price (trader's fill price)
+  slippagePct?: number;   // BUY only: max % above signal price willing to pay (default 0.02)
+};
+
+export type OrderFill = {
+  sharesPlaced: number;
 };
 
 type TickSize = '0.1' | '0.01' | '0.001' | '0.0001';
@@ -20,11 +25,6 @@ function snapToTick(price: number, tick: TickSize): number {
   return Math.round(price / increment) * increment;
 }
 
-/**
- * Fetches tickSize and negRisk for a market using its conditionId.
- * The CLOB client's getMarket() endpoint expects a conditionId — NOT a tokenId.
- * Passing tokenId here caused the "market not found" 404 error.
- */
 async function fetchMarketOptions(
   client: ClobClient,
   conditionId: string,
@@ -39,13 +39,27 @@ async function fetchMarketOptions(
   }
 }
 
-export async function postOrder(input: PostOrderInput): Promise<void> {
-  const { client, tokenId, conditionId, side, sizeUsd, price, maxAcceptablePrice } = input;
+export async function postOrder(input: PostOrderInput): Promise<OrderFill> {
+  const { client, tokenId, conditionId, side, price } = input;
+  const slippagePct = input.slippagePct ?? 0.02;
 
-  // FIXED: pass conditionId, not tokenId, so getMarket() resolves correctly
   const { tickSize, negRisk } = await fetchMarketOptions(client, conditionId);
 
-  const rawPrice = maxAcceptablePrice ?? price;
+  let rawPrice: number;
+
+  if (side === 'BUY') {
+    // Pay up to slippagePct above the signal price to ensure fill.
+    // If the market has moved more than this, the order will rest in the
+    // book at the limit rather than chasing the price.
+    rawPrice = price * (1 + slippagePct);
+  } else {
+    // SELL: use signal price as the limit exactly.
+    // We fill at market price or better (higher). If the price has fallen
+    // below the trader's exit we correctly don't fill rather than selling
+    // cheaper than they did.
+    rawPrice = price;
+  }
+
   const limitPrice = snapToTick(rawPrice, tickSize);
 
   if (limitPrice <= 0 || limitPrice >= 1) {
@@ -54,24 +68,44 @@ export async function postOrder(input: PostOrderInput): Promise<void> {
     );
   }
 
-  const size = sizeUsd / limitPrice;
+  let size: number;
+
+  if (side === 'SELL' && input.sharesExact != null) {
+    size = input.sharesExact;
+  } else if (input.sizeUsd != null) {
+    size = input.sizeUsd / limitPrice;
+  } else {
+    throw new Error('postOrder: must provide sizeUsd (BUY) or sharesExact (SELL)');
+  }
 
   if (size < 1) {
     throw new Error(
-      `Order size ${size.toFixed(4)} shares ($${sizeUsd} / $${limitPrice}) is below the ` +
-      `CLOB minimum of 1 share. Increase sizeUsd or reduce multiplier.`,
+      `Order size ${size.toFixed(4)} shares is below the CLOB minimum of 1 share. ` +
+      (side === 'BUY' ? 'Increase sizeUsd or reduce multiplier.' : 'Position too small to sell.'),
     );
   }
 
+  // BUY: expire at midnight UTC tonight — stale entry orders accumulating
+  // across days would cause unwanted fills on old signals.
+  // SELL: GTC — exits must always fill eventually to avoid stuck positions.
+  const isBuy = side === 'BUY';
+  const orderType = isBuy ? OrderType.GTD : OrderType.GTC;
+  const userOrder: Parameters<typeof client.createAndPostOrder>[0] = {
+    tokenID: tokenId,
+    price: limitPrice,
+    size,
+    side: isBuy ? Side.BUY : Side.SELL,
+    ...(isBuy && {
+      expiration: Math.floor(
+        new Date(new Date().toISOString().slice(0, 10) + 'T23:59:59Z').getTime() / 1000,
+      ),
+    }),
+  };
+
   const response = await client.createAndPostOrder(
-    {
-      tokenID: tokenId,
-      price: limitPrice,
-      size,
-      side: side === 'BUY' ? Side.BUY : Side.SELL,
-    },
+    userOrder,
     { tickSize, negRisk },
-    OrderType.GTC,
+    orderType,
   );
 
   if (!response.success) {
@@ -79,5 +113,6 @@ export async function postOrder(input: PostOrderInput): Promise<void> {
       `CLOB rejected order for token ${tokenId}: ${response.errorMsg} (status: ${response.status})`,
     );
   }
-}
 
+  return { sharesPlaced: size };
+}

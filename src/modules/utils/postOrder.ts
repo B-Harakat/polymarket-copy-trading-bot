@@ -114,5 +114,8 @@ export async function postOrder(input: PostOrderInput): Promise<OrderFill> {
     );
   }
 
-  return { sharesPlaced: size };
+  const filled = response.makingAmount
+    ? parseFloat(response.makingAmount) / 1e6
+    : size;
+  return { sharesPlaced: filled };
 }

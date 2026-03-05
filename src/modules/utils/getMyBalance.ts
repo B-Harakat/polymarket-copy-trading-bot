@@ -64,3 +64,29 @@ export async function getMyPortfolio(
 
   return { cash, invested, total: cash + invested, proxyWallet };
 }
+
+/**
+ * Fetches the live on-chain share count for a specific token from the Data API.
+ *
+ * Used before placing SELL orders to cap the sell size against the actual
+ * position held, guarding against ledger drift or stale startup seeds.
+ *
+ * Returns 0 if the position is not found or the API call fails (non-fatal).
+ */
+export async function getMyTokenBalance(
+  proxyWallet: string,
+  tokenId: string,
+): Promise<number> {
+  try {
+    const res = await fetch(`${DATA_API}/positions?user=${proxyWallet}`);
+    if (!res.ok) return 0;
+
+    const positions = await res.json() as Array<{ asset?: string; size?: number }>;
+    if (!Array.isArray(positions)) return 0;
+
+    const match = positions.find((p) => p.asset === tokenId);
+    return match?.size ?? 0;
+  } catch {
+    return 0;
+  }
+}

@@ -4,12 +4,10 @@ import type { TradeSignal } from './tradeMonitor';
 import type { PolymarketClient } from '../services/createClobClient';
 import { computeProportionalSizing } from '../config/copyStrategy';
 import { postOrder } from '../utils/postOrder';
-import { getMyPortfolio } from '../utils/getMyBalance';
+import { getMyPortfolio, getMyTokenBalance } from '../utils/getMyBalance';
 import { getTraderPortfolio } from '../utils/getTraderBalance';
 import { PositionLedger } from '../utils/positionLedger';
 import { PendingAccumulator, CLOB_MIN_SHARES } from '../utils/pendingAccumulator';
-
-const FULL_CLOSE_THRESHOLD = 0.95;
 
 export type TradeExecutorDeps = {
   client: PolymarketClient;
@@ -112,8 +110,9 @@ export class TradeExecutor {
   // 1. Proportional sizing -> targetUsdSize  (same logic as BUY)
   // 2. Convert to shares:  sharesToSell = targetUsdSize / signal.price
   // 3. Cap to ledger:      sharesToSell = min(sharesToSell, ledgerShares)
-  // 4. 95% threshold:      if sharesToSell / ledgerShares >= 0.95 -> sell all (bypass accumulator)
-  // 5. CLOB minimum:       accumulate if sharesToSell < 5
+  // 4. Cap to on-chain:    fetch live Data API balance; cap sharesToSell and sync ledger if drifted
+  // 5. 95% threshold:      if sharesToSell / ledgerShares >= 0.95 -> sell all (bypass accumulator)
+  // 6. CLOB minimum:       accumulate if sharesToSell < 5
 
   private async copySell(signal: TradeSignal): Promise<void> {
     const { logger, env, client } = this.deps;
@@ -149,25 +148,53 @@ export class TradeExecutor {
         sharesToSell = ledgerShares;
       }
 
+      // Fix 3: Cap against live on-chain balance from the Data API.
+      // The ledger can be stale (e.g. seeded from Data API at startup, or
+      // postOrder returned requested rather than actual filled shares).
+      // Selling more than we actually hold causes "not enough balance / allowance".
+      const onChainShares = await getMyTokenBalance(this.deps.proxyWallet, signal.tokenId);
+      if (onChainShares > 0 && onChainShares < ledgerShares) {
+        logger.warn(
+          `  On-chain balance (${onChainShares.toFixed(4)}) is less than ledger ` +
+          `(${ledgerShares.toFixed(4)}) -- syncing ledger down to on-chain reality.`,
+        );
+        this.ledger.seed(signal.tokenId, onChainShares);
+      }
+      const safeMaxShares = onChainShares > 0 ? onChainShares : ledgerShares;
+      if (sharesToSell > safeMaxShares) {
+        logger.warn(
+          `  Sell size ${sharesToSell.toFixed(4)} exceeds on-chain balance ` +
+          `${safeMaxShares.toFixed(4)} -- capping.`,
+        );
+        sharesToSell = safeMaxShares;
+      }
+
       logger.info(`Copying SELL "${signal.marketTitle}" @ $${signal.price}`);
       logger.info(`  ${fmt('Trader', trader)}`);
       logger.info(`  ${fmt('You   ', mine)}`);
 
-      // Full close: bypass accumulator -- always above minimum
-      const sellRatio = sharesToSell / ledgerShares;
-      if (sellRatio >= FULL_CLOSE_THRESHOLD) {
+      // Use the (potentially synced) ledger value, not the stale pre-sync snapshot.
+      const currentLedgerShares = this.ledger.getShares(signal.tokenId);
+
+      // Sub-minimum remainder check: if selling sharesToSell would leave fewer than
+      // CLOB_MIN_SHARES remaining, the leftover dust can never be sold on its own.
+      // Upgrade to a full close so the position is cleanly exited and the ledger wiped.
+      // This replaces the old 95% ratio check.
+      const sharesAfterSell = currentLedgerShares - sharesToSell;
+      if (sharesAfterSell < CLOB_MIN_SHARES) {
         logger.info(
-          `  Sell ratio ${(sellRatio * 100).toFixed(1)}% >= ${FULL_CLOSE_THRESHOLD * 100}% ` +
-          `-- upgrading to full close (${ledgerShares.toFixed(4)} shares).`,
+          `  Remainder after sell would be ${sharesAfterSell.toFixed(4)} shares ` +
+          `(< CLOB minimum ${CLOB_MIN_SHARES}) -- upgrading to full close ` +
+          `(${currentLedgerShares.toFixed(4)} shares). Ledger will be wiped.`,
         );
-        await this.placeSell(signal, ledgerShares);
+        await this.placeSell(signal, currentLedgerShares);
         return;
       }
 
       logger.info(
         `  Trade: $${signal.sizeUsd.toFixed(2)} = ${(sizing.tradeRatio * 100).toFixed(2)}% ` +
         `of their portfolio => selling ${sharesToSell.toFixed(4)} of our ` +
-        `${ledgerShares.toFixed(4)} shares`,
+        `${currentLedgerShares.toFixed(4)} shares`,
       );
 
       // Accumulate if below CLOB minimum

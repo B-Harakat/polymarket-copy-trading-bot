@@ -114,7 +114,14 @@ export async function postOrder(input: PostOrderInput): Promise<OrderFill> {
     );
   }
 
-  const filled = response.makingAmount
+  // For SELL orders: makingAmount = shares given by maker in micro-units (shares * 1e6),
+  // so /1e6 gives the actual share count filled. Use it when available.
+  // For BUY orders: makingAmount = USDC paid by maker in micro-units — NOT shares received.
+  // Using it would record the dollar cost as a share count, badly undershooting the ledger.
+  // For BUYs we always use the requested size, which is correct because:
+  //   - Resting GTD orders: filled async, size is the best we have at order-placement time.
+  //   - Immediately matched: the CLOB fills the exact size requested at the limit price.
+  const filled = (side === 'SELL' && response.makingAmount)
     ? parseFloat(response.makingAmount) / 1e6
     : size;
   return { sharesPlaced: filled };

@@ -105,6 +105,15 @@ export class PendingAccumulator {
     return this.pending.size;
   }
 
+  /**
+   * Returns the share count currently pending for a given tokenId (0 if none).
+   * Used by the caller to factor accumulated-but-not-yet-placed shares into
+   * remainder checks, preventing stuck dust after an accumulator flush.
+   */
+  getPendingShares(tokenId: string): number {
+    return this.pending.get(tokenId)?.accumulatedShares ?? 0;
+  }
+
   /** Cancel all pending accumulations (e.g. on shutdown). */
   clear(): void {
     for (const tokenId of this.pending.keys()) {

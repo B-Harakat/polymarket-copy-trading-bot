@@ -53,8 +53,8 @@ export class TradeExecutor {
         traderPortfolioTotal: trader.total,
         traderTradeUsd:       signal.sizeUsd,
         multiplier:           env.tradeMultiplier,
+        side:                 'BUY',
       });
-
       // Compute target shares using signal price (pre-slippage) so the
       // accumulator works in consistent share units across chunks.
       const targetShares = sizing.targetUsdSize / signal.price;
@@ -107,12 +107,12 @@ export class TradeExecutor {
 
   // SELL
   //
-  // 1. Proportional sizing -> targetUsdSize  (same logic as BUY)
+  // 1. Proportional sizing -> targetUsdSize  (same logic as BUY, but no $1.05 floor)
   // 2. Convert to shares:  sharesToSell = targetUsdSize / signal.price
   // 3. Cap to ledger:      sharesToSell = min(sharesToSell, ledgerShares)
   // 4. Cap to on-chain:    fetch live Data API balance; cap sharesToSell and sync ledger if drifted
-  // 5. 95% threshold:      if sharesToSell / ledgerShares >= 0.95 -> sell all (bypass accumulator)
-  // 6. CLOB minimum:       accumulate if sharesToSell < 5
+  // 5. Sub-min remainder:  if (ledger - pending - sharesToSell) < CLOB_MIN -> full close + wipe ledger
+  // 6. CLOB minimum:       accumulate if sharesToSell < CLOB_MIN_SHARES
 
   private async copySell(signal: TradeSignal): Promise<void> {
     const { logger, env, client } = this.deps;
@@ -136,6 +136,7 @@ export class TradeExecutor {
         traderPortfolioTotal: trader.total,
         traderTradeUsd:       signal.sizeUsd,
         multiplier:           env.tradeMultiplier,
+        side:                 'SELL',
       });
 
       let sharesToSell = sizing.targetUsdSize / signal.price;
@@ -179,8 +180,11 @@ export class TradeExecutor {
       // Sub-minimum remainder check: if selling sharesToSell would leave fewer than
       // CLOB_MIN_SHARES remaining, the leftover dust can never be sold on its own.
       // Upgrade to a full close so the position is cleanly exited and the ledger wiped.
-      // This replaces the old 95% ratio check.
-      const sharesAfterSell = currentLedgerShares - sharesToSell;
+      // We also factor in any shares already sitting in the accumulator for this token,
+      // because those will be flushed as a combined sell later — if the combined amount
+      // would leave dust, we should full-close now rather than after the flush.
+      const pendingAccumulatedShares = this.accumulator.getPendingShares(signal.tokenId);
+      const sharesAfterSell = currentLedgerShares - pendingAccumulatedShares - sharesToSell;
       if (sharesAfterSell < CLOB_MIN_SHARES) {
         logger.info(
           `  Remainder after sell would be ${sharesAfterSell.toFixed(4)} shares ` +

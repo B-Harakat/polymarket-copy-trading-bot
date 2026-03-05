@@ -75,7 +75,13 @@ export class TradeMonitor {
 
   // Shared dedup set — used by both RTDS and polling paths
   private readonly seenTxHashes = new Set<string>();
-  private readonly pendingFire = new Set<string>();
+
+  // Per-trader signal queues. Each trader has an ordered queue of signals waiting
+  // to be executed, and a boolean indicating whether a signal is currently running.
+  // This replaces the old pendingFire set, which would permanently drop any signal
+  // that arrived while another was executing for the same trader.
+  private readonly traderQueues = new Map<string, TradeSignal[]>();
+  private readonly traderRunning = new Set<string>();
 
   // RTDS state
   private ws?: WebSocket;
@@ -165,6 +171,8 @@ export class TradeMonitor {
     clearInterval(this.pollTimer);
     this.ws?.terminate();
     this.ws = undefined;
+    this.traderQueues.clear();
+    this.traderRunning.clear();
   }
 
   // ── Polling fallback ───────────────────────────────────────────────────────
@@ -325,10 +333,8 @@ export class TradeMonitor {
     const dedupKey = this.dedupKey(traderAddr, trade.transactionHash);
     if (this.seenTxHashes.has(dedupKey)) return;
 
-    if (this.pendingFire.has(traderAddr)) return;
-
+    // Mark as seen immediately so neither RTDS nor polling re-emits this tx.
     this.seenTxHashes.add(dedupKey);
-    this.pendingFire.add(traderAddr);
 
     const sizeUsd = trade.size * trade.price;
     const label = shortAddr(traderAddr);
@@ -352,15 +358,34 @@ export class TradeMonitor {
       marketTitle: trade.title,
     };
 
-    void (async () => {
+    // Enqueue signal for this trader and drain sequentially.
+    // If another signal is already executing for this trader, this one waits
+    // in the queue rather than being dropped.
+    if (!this.traderQueues.has(traderAddr)) {
+      this.traderQueues.set(traderAddr, []);
+    }
+    this.traderQueues.get(traderAddr)!.push(signal);
+
+    if (!this.traderRunning.has(traderAddr)) {
+      void this.drainQueue(traderAddr, source, label);
+    }
+  }
+
+  private async drainQueue(traderAddr: string, source: string, label: string): Promise<void> {
+    const { logger } = this.deps;
+    this.traderRunning.add(traderAddr);
+
+    const queue = this.traderQueues.get(traderAddr)!;
+    while (queue.length > 0) {
+      const signal = queue.shift()!;
       try {
         await this.deps.onDetectedTrade(signal);
       } catch (err) {
         logger.error(`[${source}] [${label}] onDetectedTrade threw`, err as Error);
-      } finally {
-        this.pendingFire.delete(traderAddr);
       }
-    })();
+    }
+
+    this.traderRunning.delete(traderAddr);
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
